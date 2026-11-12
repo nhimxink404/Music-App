@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.env
+*.log
+.DS_Store
+backend/storage/music/*
+!backend/storage/music/.gitkeep
+.vite/
+coverage/

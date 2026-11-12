@@ -1,0 +1,41 @@
+services:
+  backend:
+    build:
+      context: ./backend
+    image: ${BACKEND_IMAGE:-sonora-backend:local}
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 5000
+      MONGODB_URI: ${MONGODB_URI:?MONGODB_URI must be configured}
+      CLIENT_ORIGIN: ${CLIENT_ORIGIN:-http://localhost}
+      MUSIC_DIR: /app/storage/music
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-300}
+      TELEGRAM_DOWNLOAD_LIMIT_MB: ${TELEGRAM_DOWNLOAD_LIMIT_MB:-20}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_ALLOWED_USER_IDS: ${TELEGRAM_ALLOWED_USER_IDS:-}
+    volumes:
+      - music_files:/app/storage/music
+    networks:
+      - sonora
+
+  frontend:
+    build:
+      context: ./frontend
+    image: ${FRONTEND_IMAGE:-sonora-frontend:local}
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${APP_HOST:-127.0.0.1}:${APP_PORT:-10017}:80"
+    networks:
+      - sonora
+
+volumes:
+  music_files:
+    name: ${MUSIC_VOLUME_NAME:-sonora_music_files}
+
+networks:
+  sonora:
+    driver: bridge

@@ -1,0 +1,170 @@
+name: Sonora CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: sonora-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        app: [backend, frontend]
+    defaults:
+      run:
+        working-directory: ${{ matrix.app }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ${{ matrix.app }}/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Test backend
+        if: matrix.app == 'backend'
+        run: npm test
+
+      - name: Lint frontend
+        if: matrix.app == 'frontend'
+        run: npm run lint
+
+      - name: Build frontend
+        if: matrix.app == 'frontend'
+        run: npm run build
+
+      - name: Validate Docker Compose
+        if: matrix.app == 'frontend'
+        run: docker compose --env-file ../.env.example -f ../docker-compose.yml config --quiet
+
+  publish:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: verify
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        app: [backend, frontend]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Normalize image owner
+        id: image
+        shell: bash
+        run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./${{ matrix.app }}
+          push: true
+          tags: |
+            ghcr.io/${{ steps.image.outputs.owner }}/sonora-${{ matrix.app }}:latest
+            ghcr.io/${{ steps.image.outputs.owner }}/sonora-${{ matrix.app }}:${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.app }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.app }}
+
+  deploy:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: publish
+    runs-on: ubuntu-latest
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+    steps:
+      - name: Deployment not configured
+        if: env.DEPLOY_HOST == ''
+        run: echo "Skipping deploy because DEPLOY_HOST is not configured."
+
+      - name: Checkout
+        if: env.DEPLOY_HOST != ''
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        if: env.DEPLOY_HOST != ''
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" | tr -d '\r' > ~/.ssh/sonora_deploy
+          chmod 600 ~/.ssh/sonora_deploy
+          port="${DEPLOY_PORT:-22}"
+          ssh-keyscan -p "$port" "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: Prepare production environment
+        if: env.DEPLOY_HOST != ''
+        env:
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+          CLIENT_ORIGIN: ${{ secrets.CLIENT_ORIGIN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_ALLOWED_USER_IDS: ${{ secrets.TELEGRAM_ALLOWED_USER_IDS }}
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          umask 077
+          {
+            printf 'MONGODB_URI=%s\n' "$MONGODB_URI"
+            printf 'CLIENT_ORIGIN=%s\n' "${CLIENT_ORIGIN:-https://collabos.xyz}"
+            printf 'MAX_UPLOAD_MB=300\n'
+            printf 'TELEGRAM_BOT_TOKEN=%s\n' "$TELEGRAM_BOT_TOKEN"
+            printf 'TELEGRAM_ALLOWED_USER_IDS=%s\n' "$TELEGRAM_ALLOWED_USER_IDS"
+            printf 'APP_HOST=127.0.0.1\n'
+            printf 'APP_PORT=10017\n'
+            printf 'MUSIC_VOLUME_NAME=sonora_music_files\n'
+            printf 'BACKEND_IMAGE=ghcr.io/%s/sonora-backend:latest\n' "$owner"
+            printf 'FRONTEND_IMAGE=ghcr.io/%s/sonora-frontend:latest\n' "$owner"
+          } > .deploy.env
+
+      - name: Upload deployment files
+        if: env.DEPLOY_HOST != ''
+        run: |
+          set -euo pipefail
+          user="${DEPLOY_USER:-root}"
+          port="${DEPLOY_PORT:-22}"
+          ssh -i ~/.ssh/sonora_deploy -p "$port" "$user@$DEPLOY_HOST" 'install -d -m 700 /opt/sonora'
+          scp -i ~/.ssh/sonora_deploy -P "$port" docker-compose.yml "$user@$DEPLOY_HOST:/opt/sonora/docker-compose.yml"
+          scp -i ~/.ssh/sonora_deploy -P "$port" .deploy.env "$user@$DEPLOY_HOST:/opt/sonora/.env"
+
+      - name: Pull and restart Sonora
+        if: env.DEPLOY_HOST != ''
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          user="${DEPLOY_USER:-root}"
+          port="${DEPLOY_PORT:-22}"
+          printf '%s' "$GHCR_TOKEN" | ssh -i ~/.ssh/sonora_deploy -p "$port" "$user@$DEPLOY_HOST" "docker login ghcr.io -u '$GITHUB_ACTOR' --password-stdin"
+          ssh -i ~/.ssh/sonora_deploy -p "$port" "$user@$DEPLOY_HOST" 'cd /opt/sonora && chmod 600 .env && docker compose -p sonora --env-file .env pull && docker compose -p sonora --env-file .env up -d --no-build --remove-orphans && docker compose -p sonora ps && curl --fail --retry 12 --retry-delay 5 http://127.0.0.1:10017/healthz'
